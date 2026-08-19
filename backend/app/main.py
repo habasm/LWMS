@@ -2,7 +2,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, JSONResponse
 from sqlalchemy import inspect
 from .core.config import settings
 from .core.database import Base, engine
@@ -75,18 +75,25 @@ def create_development_tables():
             if 'time_from' not in schedule_columns: connection.exec_driver_sql('ALTER TABLE schedules ADD COLUMN time_from TIME')
             if 'time_to' not in schedule_columns: connection.exec_driver_sql('ALTER TABLE schedules ADD COLUMN time_to TIME')
             if 'instructor_name' not in schedule_columns: connection.exec_driver_sql('ALTER TABLE schedules ADD COLUMN instructor_name VARCHAR(160)')
-    # Creates the roles and initial Super Admin only when they do not exist.
+    # Creates the roles and initial demo accounts only when they do not exist.
     # It is idempotent, so it is also safe on each local startup.
     seed()
 
 # Serve the Vite single-page application after all API routes are registered.
 # This keeps /api/v1, /docs, and /health available while supporting client routes.
 dist_dir = Path(__file__).resolve().parents[2] / 'frontend' / 'dist'
-if dist_dir.is_dir():
-    app.mount('/assets', StaticFiles(directory=dist_dir / 'assets'), name='assets')
-    @app.get('/{client_path:path}', include_in_schema=False)
-    def serve_frontend(client_path: str):
-        requested = dist_dir / client_path
-        if client_path and requested.is_file() and requested.resolve().is_relative_to(dist_dir.resolve()):
-            return FileResponse(requested)
-        return FileResponse(dist_dir / 'index.html')
+assets_dir = dist_dir / 'assets'
+if assets_dir.is_dir():
+    app.mount('/assets', StaticFiles(directory=assets_dir), name='assets')
+
+@app.get('/{client_path:path}', include_in_schema=False)
+def serve_frontend(client_path: str):
+    if not dist_dir.is_dir():
+        return JSONResponse(
+            {'detail':'Frontend build not found. Run npm run build inside the frontend folder, then restart the backend.'},
+            status_code=404,
+        )
+    requested = dist_dir / client_path
+    if client_path and requested.is_file() and requested.resolve().is_relative_to(dist_dir.resolve()):
+        return FileResponse(requested)
+    return FileResponse(dist_dir / 'index.html')

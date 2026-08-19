@@ -8,7 +8,8 @@ from .models import User
 bearer=HTTPBearer()
 def current_user(credentials:HTTPAuthorizationCredentials=Depends(bearer),db:Session=Depends(get_db))->User:
     data=decode_token(credentials.credentials); user=db.get(User,int(data['sub']))
-    if not user or not user.is_active: raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail='Inactive account')
+    if not user: raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail='Invalid session')
+    if not user.is_active: raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail='Your account is disabled. Please contact the system administrator.')
     return user
 def require_roles(*allowed:str)->Callable:
     def guard(user:User=Depends(current_user))->User:

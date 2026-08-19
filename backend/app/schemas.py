@@ -33,7 +33,17 @@ class EquipmentUsageCreate(BaseModel): resource_id:int; quantity:int=Field(gt=0)
 class EquipmentUsageDecision(BaseModel): decision:str=Field(pattern='^(approved|rejected)$'); notes:str|None=None
 class EquipmentIn(BaseModel): name:str; asset_number:str; category:str; purchase_date:date|None=None; status:EquipmentStatus=EquipmentStatus.available; facility_id:int
 class MaintenanceIn(BaseModel): title:str; details:str|None=None; priority:str='medium'; kind:str='internal'; equipment_id:int|None=None; technician_id:int|None=None; cost:float|None=None
-class MaintenanceWorkflowCreate(BaseModel): resource_id:int; asset_id:int; title:str=Field(min_length=3); details:str=Field(min_length=3); priority:str=Field(pattern='^(low|medium|high|critical)$'); kind:str=Field(default='internal',pattern='^(internal|external)$')
+class MaintenanceWorkflowCreate(BaseModel):
+    resource_id:int; asset_id:int|None=None; asset_ids:list[int]=Field(default_factory=list); title:str=Field(min_length=3); details:str=Field(min_length=3); priority:str=Field(pattern='^(low|medium|high|critical)$'); kind:str=Field(default='internal',pattern='^(internal|external)$')
+    @model_validator(mode='after')
+    def has_assets(self):
+        ids=[self.asset_id] if self.asset_id else []
+        ids.extend(self.asset_ids)
+        cleaned=[]
+        for value in ids:
+            if value and value not in cleaned: cleaned.append(value)
+        if not cleaned: raise ValueError('Select at least one serial or asset number')
+        self.asset_ids=cleaned;self.asset_id=cleaned[0];return self
 class MaintenanceAssignmentIn(BaseModel): technician_id:int; notes:str|None=None
 class MaintenanceActionIn(BaseModel): notes:str=Field(min_length=2)
 class MaintenanceResolutionIn(BaseModel): resolution:str=Field(pattern='^(fixed|not_fixed)$'); notes:str=Field(min_length=2); cost:float|None=Field(default=None,ge=0)
