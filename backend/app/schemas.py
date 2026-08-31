@@ -4,9 +4,9 @@ from .models import EquipmentStatus, ProjectStatus, Status
 class ORM(BaseModel): model_config=ConfigDict(from_attributes=True)
 class Login(BaseModel): email: str = Field(min_length=3, max_length=255); password: str
 class Token(BaseModel): access_token: str; token_type: str='bearer'; must_change_password: bool=False
-class UserCreate(BaseModel): email: EmailStr; full_name: str=Field(min_length=2); role_names: list[str]=Field(min_length=1); password: str|None=Field(default=None,min_length=8); assigned_facility_id:int|None=None
-class UserUpdate(BaseModel): email:EmailStr|None=None; full_name:str|None=Field(default=None,min_length=2); role_names:list[str]|None=None; assigned_facility_id:int|None=None; is_active:bool|None=None
-class UserOut(ORM): id:int; email:str; full_name:str; must_change_password:bool; is_active:bool; assigned_facility_id:int|None=None
+class UserCreate(BaseModel): email: EmailStr; full_name: str=Field(min_length=2); role_names: list[str]=Field(min_length=1); password: str|None=Field(default=None,min_length=8); assigned_facility_id:int|None=None; assigned_facility_ids:list[int]=Field(default_factory=list)
+class UserUpdate(BaseModel): email:EmailStr|None=None; full_name:str|None=Field(default=None,min_length=2); role_names:list[str]|None=None; assigned_facility_id:int|None=None; assigned_facility_ids:list[int]|None=None; is_active:bool|None=None
+class UserOut(ORM): id:int; email:str; full_name:str; must_change_password:bool; is_active:bool; assigned_facility_id:int|None=None; assigned_facility_ids:list[int]=Field(default_factory=list); pending_facility_ids:list[int]=Field(default_factory=list)
 class PasswordChange(BaseModel): current_password:str; new_password:str=Field(min_length=8)
 class FacilityIn(BaseModel): name:str; kind:str=Field(pattern='^(laboratory|workshop)$'); capacity:int=Field(gt=0); location:str; description:str|None=None; manager_id:int|None=None
 class FacilityResourceIn(BaseModel):
@@ -29,7 +29,16 @@ class FacilityResourceUpdate(BaseModel):
         return self
 class ResourceReviewIn(BaseModel): decision:str=Field(pattern='^(accepted|rejected)$'); notes:str=Field(min_length=3,max_length=1000)
 class ResourceActionIn(BaseModel): notes:str=Field(min_length=3,max_length=1000)
-class EquipmentUsageCreate(BaseModel): resource_id:int; quantity:int=Field(gt=0); usage_type:str=Field(default='consumed',pattern='^(consumed|discarded)$'); purpose:str=Field(min_length=3)
+class EquipmentUsageCreate(BaseModel):
+    resource_id:int; quantity:int=Field(gt=0); usage_type:str=Field(default='consumed',pattern='^(consumed|discarded)$'); purpose:str=Field(min_length=3); asset_ids:list[int]=Field(default_factory=list)
+    @model_validator(mode='after')
+    def clean_assets(self):
+        cleaned=[]
+        for value in self.asset_ids:
+            if value and value not in cleaned: cleaned.append(value)
+        self.asset_ids=cleaned
+        if cleaned: self.quantity=len(cleaned)
+        return self
 class EquipmentUsageDecision(BaseModel): decision:str=Field(pattern='^(approved|rejected)$'); notes:str|None=None
 class EquipmentIn(BaseModel): name:str; asset_number:str; category:str; purchase_date:date|None=None; status:EquipmentStatus=EquipmentStatus.available; facility_id:int
 class MaintenanceIn(BaseModel): title:str; details:str|None=None; priority:str='medium'; kind:str='internal'; equipment_id:int|None=None; technician_id:int|None=None; cost:float|None=None

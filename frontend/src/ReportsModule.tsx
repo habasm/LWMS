@@ -6,11 +6,12 @@ import './reports.css'
 type Maintenance={id:number;title:string;details:string;priority:string;kind:string;status:string;resource_id:number;asset_identifier?:string|null;facility_id?:number|null;resolution?:string|null;assistant_verification?:string|null;cost?:number|null;created_at?:string}
 type Resource={id:number;name:string;category?:string;facility_id?:number}
 type Facility={id:number;name:string;kind?:string}
-type ReportUser={role_names:string[];assigned_facility_id:number|null}
+type ReportUser={role_names:string[];assigned_facility_id:number|null;assigned_facility_ids?:number[]}
 type Row={label:string;total:number;open:number;fixed:number;notFixed:number;pending:number;verification:number}
 
 const isOpen=(item:Maintenance)=>!['completed','rejected'].includes(item.status)
 const canSeeAll=(user:ReportUser)=>user.role_names.some(role=>['dean','coordinator','super_admin'].includes(role))
+const activeFacilityIds=(user:ReportUser)=>new Set(user.assigned_facility_ids?.length?user.assigned_facility_ids:(user.assigned_facility_id?[user.assigned_facility_id]:[]))
 
 function count(items:Maintenance[]){
   return {
@@ -31,7 +32,7 @@ function grouped(items:Maintenance[],label:(item:Maintenance)=>string):Row[]{
 }
 
 export function MaintenanceQuickSummary({user,items,resources,facilities}:{user:ReportUser;items:Maintenance[];resources:Resource[];facilities:Facility[]}){
-  const scoped=useMemo(()=>canSeeAll(user)?items:items.filter(item=>item.facility_id===user.assigned_facility_id),[items,user])
+  const scoped=useMemo(()=>{const ids=activeFacilityIds(user);return canSeeAll(user)?items:items.filter(item=>item.facility_id&&ids.has(item.facility_id))},[items,user])
   const summary=count(scoped),resourceRows=grouped(scoped,item=>resources.find(resource=>resource.id===item.resource_id)?.name??`Resource #${item.resource_id}`),facilityRows=grouped(scoped,item=>facilities.find(facility=>facility.id===item.facility_id)?.name??'Unassigned facility')
   return <div className="maintenance-quick-summary"><section className="report-metrics"><div><span>Total reports</span><strong>{summary.total}</strong><small>all maintenance records</small></div><div><span>Open</span><strong>{summary.open}</strong><small>not completed or rejected</small></div><div><span>Fixed</span><strong>{summary.fixed}</strong><small>successful repairs</small></div><div><span>Not fixed</span><strong>{summary.notFixed}</strong><small>failed or unresolved repairs</small></div><div><span>Pending</span><strong>{summary.pending}</strong><small>awaiting approval</small></div><div><span>Needs check</span><strong>{summary.verification}</strong><small>assistant verification required</small></div></section><section className="report-grid"><ReportTable title="By resource" rows={resourceRows}/>{canSeeAll(user)&&<ReportTable title="By facility" rows={facilityRows}/>}</section></div>
 }

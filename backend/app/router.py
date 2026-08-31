@@ -17,12 +17,46 @@ MANAGEMENT_ROLES=COORDINATOR_ROLES|DEAN_ROLES
 OPERATIONAL_USER_ROLES={'lab_admin','maintainer'}
 def has_any(user:User,names:set[str]): return bool({role.name for role in user.roles}.intersection(names))
 def role_names(user:User): return {role.name for role in user.roles}
+def user_facility_ids(user:User,include_pending:bool=False):
+    ids=set(user.assigned_facility_ids or [])
+    if user.assigned_facility_id: ids.add(user.assigned_facility_id)
+    if include_pending: ids.update(user.pending_facility_ids or [])
+    return ids
+def set_user_facility_ids(user:User,ids:set[int]):
+    cleaned=sorted(ids);user.assigned_facility_ids=cleaned;user.assigned_facility_id=cleaned[0] if cleaned else None
+def facility_payload(db:Session,facility_id:int):
+    facility=db.get(Facility,facility_id)
+    return {'id':facility.id,'name':facility.name,'kind':facility.kind,'location':facility.location,'capacity':facility.capacity} if facility else None
+def facilities_payload(db:Session,ids:set[int]):
+    return [item for item in (facility_payload(db,facility_id) for facility_id in sorted(ids)) if item]
 def audit(db:Session,actor:User|None,action:str,entity:str,entity_id:int|None=None):
     db.add(AuditLog(actor_id=actor.id if actor else None,action=action,entity=entity,entity_id=entity_id))
 def added_by_name(db:Session,entity:str,entity_id:int):
     event=db.scalar(select(AuditLog).where(AuditLog.entity==entity,AuditLog.entity_id==entity_id,AuditLog.action=='created').order_by(AuditLog.created_at,AuditLog.id).limit(1))
     actor=db.get(User,event.actor_id) if event and event.actor_id else None
     return actor.full_name if actor else 'System'
+def user_activity(db:Session,user_id:int):
+    rows=db.scalars(select(AuditLog).where(AuditLog.entity=='user',AuditLog.entity_id==user_id).order_by(AuditLog.created_at.desc(),AuditLog.id.desc()).limit(8)).all()
+    data=[]
+    for row in rows:
+        actor=db.get(User,row.actor_id) if row.actor_id else None
+        data.append({'id':row.id,'action':row.action,'actor_name':actor.full_name if actor else 'System','created_at':row.created_at})
+    return data
+def facility_owner(db:Session,facility_id:int,exclude_user_id:int|None=None):
+    for user in db.scalars(select(User)).all():
+        if exclude_user_id and user.id==exclude_user_id: continue
+        if 'lab_admin' in role_names(user) and facility_id in user_facility_ids(user):
+            return user
+    return None
+def facility_has_pending_transfer(db:Session,facility_id:int):
+    for user in db.scalars(select(User)).all():
+        if facility_id in set(user.pending_facility_ids or []): return True
+    return False
+def outgoing_pending_facilities(db:Session,user:User):
+    owned=user_facility_ids(user);pending=set()
+    for other in db.scalars(select(User)).all():
+        if other.id!=user.id: pending.update(owned.intersection(set(other.pending_facility_ids or [])))
+    return pending
 def ensure_user_role_scope(actor:User,target_roles:set[str],target:User|None=None):
     if has_any(actor,DEAN_ROLES):
         if target_roles!={'coordinator'}: raise HTTPException(403,'Dean can only manage coordinator accounts')
@@ -39,6 +73,27 @@ def require_new_assistant_handover(db:Session,facility_id:int,actor:User,assista
     for resource in db.scalars(select(FacilityResource).where(FacilityResource.facility_id==facility_id,FacilityResource.archived.is_(False))).all():
         before=resource_snapshot(resource);resource.revision=(resource.revision or 1)+1;resource.review_status='pending';resource.review_notes=None;resource.accepted=False;resource.submitted_by_id=actor.id;resource.checked_by_id=None;resource.checked_at=None
         record_resource_history(db,resource,actor,'assigned_to_new_assistant',f'Handover assigned to {assistant.full_name}; acceptance is required after first password change',before,before)
+def finalize_pending_facility_if_ready(db:Session,assistant:User,facility_id:int,actor:User):
+    if facility_id not in set(assistant.pending_facility_ids or []): return
+    pending=db.scalar(select(FacilityResource.id).where(FacilityResource.facility_id==facility_id,FacilityResource.archived.is_(False),FacilityResource.review_status!='accepted').limit(1))
+    if pending: return
+    for other in db.scalars(select(User)).all():
+        if other.id!=assistant.id and 'lab_admin' in role_names(other) and facility_id in user_facility_ids(other):
+            set_user_facility_ids(other,user_facility_ids(other)-{facility_id})
+            audit(db,actor,'facility_transferred_out','user',other.id)
+    set_user_facility_ids(assistant,user_facility_ids(assistant)|{facility_id})
+    assistant.pending_facility_ids=[value for value in (assistant.pending_facility_ids or []) if value!=facility_id]
+    audit(db,actor,'facility_transfer_accepted','user',assistant.id)
+def accept_pending_facility_owner(db:Session,assistant:User,facility_id:int,actor:User):
+    if facility_id not in set(assistant.pending_facility_ids or []): raise HTTPException(403,'This facility ownership transfer is not pending for your account')
+    owner=facility_owner(db,facility_id,assistant.id)
+    if owner:
+        set_user_facility_ids(owner,user_facility_ids(owner)-{facility_id})
+        audit(db,actor,f'facility_transferred_out:{facility_id}','user',owner.id)
+    set_user_facility_ids(assistant,user_facility_ids(assistant)|{facility_id})
+    assistant.pending_facility_ids=[value for value in (assistant.pending_facility_ids or []) if value!=facility_id]
+    require_new_assistant_handover(db,facility_id,actor,assistant)
+    audit(db,actor,f'facility_ownership_accepted:{facility_id}','user',assistant.id)
 @api.post('/auth/login',response_model=Token)
 def login(payload:Login,db:Session=Depends(get_db)):
     user=db.scalar(select(User).where(User.email==payload.email))
@@ -47,8 +102,8 @@ def login(payload:Login,db:Session=Depends(get_db)):
     return Token(access_token=create_token(str(user.id),[r.name for r in user.roles]),must_change_password=user.must_change_password)
 @api.get('/auth/me')
 def me(user:User=Depends(current_user),db:Session=Depends(get_db)):
-    facility=db.get(Facility,user.assigned_facility_id) if user.assigned_facility_id else None
-    return {'id':user.id,'email':user.email,'full_name':user.full_name,'is_active':user.is_active,'must_change_password':user.must_change_password,'assigned_facility_id':user.assigned_facility_id,'assigned_facility':{'id':facility.id,'name':facility.name,'kind':facility.kind,'location':facility.location,'capacity':facility.capacity} if facility else None,'role_names':[role.name for role in user.roles]}
+    assigned=user_facility_ids(user);pending=set(user.pending_facility_ids or []);facility=facility_payload(db,user.assigned_facility_id) if user.assigned_facility_id else None
+    return {'id':user.id,'email':user.email,'full_name':user.full_name,'is_active':user.is_active,'must_change_password':user.must_change_password,'assigned_facility_id':user.assigned_facility_id,'assigned_facility':facility,'assigned_facility_ids':sorted(assigned),'assigned_facilities':facilities_payload(db,assigned),'pending_facility_ids':sorted(pending),'pending_facilities':facilities_payload(db,pending),'role_names':[role.name for role in user.roles]}
 @api.post('/auth/change-password',status_code=204)
 def change_password(payload:PasswordChange,user:User=Depends(current_user),db:Session=Depends(get_db)):
     if not verify_password(payload.current_password,user.password_hash): raise HTTPException(400,'Current password is incorrect')
@@ -67,7 +122,7 @@ def users(skip:int=0,limit:int=Query(25,le=100),search:str|None=None,active:str=
     query=(search or '').strip().lower()
     if query: all_users=[u for u in all_users if query in u.full_name.lower() or query in u.email.lower()]
     rows=all_users[skip:skip+limit]
-    return {'data':[{'id':u.id,'email':u.email,'full_name':u.full_name,'is_active':u.is_active,'must_change_password':u.must_change_password,'assigned_facility_id':u.assigned_facility_id,'role_names':[r.name for r in u.roles],'added_by_name':added_by_name(db,'user',u.id)} for u in rows],'meta':{'total':len(all_users),'skip':skip,'limit':limit}}
+    return {'data':[{'id':u.id,'email':u.email,'full_name':u.full_name,'is_active':u.is_active,'must_change_password':u.must_change_password,'assigned_facility_id':u.assigned_facility_id,'assigned_facility_ids':sorted(user_facility_ids(u)),'assigned_facilities':facilities_payload(db,user_facility_ids(u)),'pending_facility_ids':u.pending_facility_ids or [],'pending_facilities':facilities_payload(db,set(u.pending_facility_ids or [])),'outgoing_pending_facility_ids':sorted(outgoing_pending_facilities(db,u)),'outgoing_pending_facilities':facilities_payload(db,outgoing_pending_facilities(db,u)),'role_names':[r.name for r in u.roles],'added_by_name':added_by_name(db,'user',u.id),'activity':user_activity(db,u.id)} for u in rows],'meta':{'total':len(all_users),'skip':skip,'limit':limit}}
 @api.post('/users',response_model=UserOut,status_code=201)
 def create_user(payload:UserCreate,db:Session=Depends(get_db),actor:User=Depends(require_roles('dean','coordinator','super_admin'))):
     ensure_user_role_scope(actor,set(payload.role_names))
@@ -76,16 +131,16 @@ def create_user(payload:UserCreate,db:Session=Depends(get_db),actor:User=Depends
     if len(roles)!=len(set(payload.role_names)): raise HTTPException(422,'One or more roles are invalid')
     # Administrators may set a temporary password, otherwise use first-name + password.
     # Every provisioned account must update this initial credential on first login.
-    if payload.assigned_facility_id:
-        facility=db.get(Facility,payload.assigned_facility_id)
-        if not facility: raise HTTPException(422,'Selected facility does not exist')
-        if 'lab_admin' not in payload.role_names: raise HTTPException(422,'A facility can only be assigned to a facility assistant')
+    selected_facility_ids=set(payload.assigned_facility_ids or ([] if payload.assigned_facility_id is None else [payload.assigned_facility_id]))
+    if selected_facility_ids:
+        if 'lab_admin' not in payload.role_names: raise HTTPException(422,'Facilities can only be assigned to a facility assistant')
+        for facility_id in selected_facility_ids:
+            if not db.get(Facility,facility_id): raise HTTPException(422,'Selected facility does not exist')
     default_password=f"{payload.full_name.strip().split()[0].lower()}password"
     user=User(email=payload.email,full_name=payload.full_name,password_hash=hash_password(payload.password or default_password),must_change_password=True,roles=roles); db.add(user);db.flush()
-    if payload.assigned_facility_id:
-        assigned=db.get(Facility,payload.assigned_facility_id)
-        user.assigned_facility_id=assigned.id
-        require_new_assistant_handover(db,assigned.id,actor,user)
+    if selected_facility_ids:
+        set_user_facility_ids(user,selected_facility_ids)
+        for facility_id in selected_facility_ids: require_new_assistant_handover(db,facility_id,actor,user)
     audit(db,actor,'created','user',user.id)
     db.commit();db.refresh(user);return user
 @api.patch('/users/{user_id}',response_model=UserOut)
@@ -95,7 +150,7 @@ def update_user(user_id:int,payload:UserUpdate,db:Session=Depends(get_db),actor:
     if has_any(actor,DEAN_ROLES):
         current=role_names(user);requested=set(payload.role_names) if payload.role_names is not None else current
         if current!={'coordinator'} or requested!={'coordinator'}: raise HTTPException(403,'Dean can only update coordinator accounts')
-    previous_facility_id=user.assigned_facility_id
+    previous_facility_ids=user_facility_ids(user)
     data=payload.model_dump(exclude_unset=True)
     requested_role_names=data.pop('role_names',None)
     if requested_role_names is not None:
@@ -104,20 +159,69 @@ def update_user(user_id:int,payload:UserUpdate,db:Session=Depends(get_db),actor:
         if len(roles)!=len(set(requested_role_names)): raise HTTPException(422,'One or more roles are invalid')
         user.roles=roles
     else: ensure_user_role_scope(actor,role_names(user),user)
-    selected_facility_id=data.get('assigned_facility_id',user.assigned_facility_id)
+    if 'assigned_facility_ids' in data:
+        selected_facility_ids=set(data.pop('assigned_facility_ids') or [])
+    elif 'assigned_facility_id' in data:
+        selected_facility_ids=set([] if data.get('assigned_facility_id') is None else [data.get('assigned_facility_id')])
+    else:
+        selected_facility_ids=previous_facility_ids
     selected_role_names=requested_role_names if requested_role_names is not None else [role.name for role in user.roles]
-    if selected_facility_id:
-        facility=db.get(Facility,selected_facility_id)
-        if not facility: raise HTTPException(422,'Selected facility does not exist')
-        if 'lab_admin' not in selected_role_names: raise HTTPException(422,'A facility can only be assigned to a facility assistant')
+    if selected_facility_ids:
+        if 'lab_admin' not in selected_role_names: raise HTTPException(422,'Facilities can only be assigned to a facility assistant')
+        for facility_id in selected_facility_ids:
+            if not db.get(Facility,facility_id): raise HTTPException(422,'Selected facility does not exist')
     for managed in db.scalars(select(Facility).where(Facility.manager_id==user.id)).all(): managed.manager_id=None
+    if 'assigned_facility_id' in data: data.pop('assigned_facility_id')
     for key,value in data.items(): setattr(user,key,value)
-    if selected_facility_id and selected_facility_id!=previous_facility_id: require_new_assistant_handover(db,selected_facility_id,actor,user)
+    if selected_facility_ids!=previous_facility_ids:
+        set_user_facility_ids(user,selected_facility_ids)
+        for facility_id in selected_facility_ids-previous_facility_ids: require_new_assistant_handover(db,facility_id,actor,user)
     audit(db,actor,'updated','user',user.id)
     try: db.commit()
     except IntegrityError:
         db.rollback();raise HTTPException(409,'Email is already registered')
     db.refresh(user);return user
+@api.post('/users/{user_id}/transfer-facilities')
+def transfer_facilities(user_id:int,payload:UserUpdate,db:Session=Depends(get_db),actor:User=Depends(require_roles('coordinator','super_admin'))):
+    user=db.get(User,user_id)
+    if not user or 'lab_admin' not in role_names(user): raise HTTPException(404,'Facility assistant not found')
+    facility_ids=set(payload.assigned_facility_ids or ([] if payload.assigned_facility_id is None else [payload.assigned_facility_id]))
+    if not facility_ids: raise HTTPException(422,'Select at least one facility to transfer')
+    for facility_id in facility_ids:
+        if not db.get(Facility,facility_id): raise HTTPException(422,'Selected facility does not exist')
+        if facility_has_pending_transfer(db,facility_id): raise HTTPException(409,'This facility already has a pending transfer. Cancel it before requesting another transfer.')
+        current_owner=facility_owner(db,facility_id,user.id)
+        if not current_owner: raise HTTPException(422,'Only a facility with a current assistant owner can be transferred')
+        user.pending_facility_ids=sorted(set(user.pending_facility_ids or [])|{facility_id})
+        audit(db,actor,f'facility_transfer_requested:{facility_id}','user',user.id)
+        if current_owner: audit(db,actor,f'facility_transfer_pending_from:{facility_id}','user',current_owner.id)
+    db.commit();db.refresh(user)
+    return {'message':'Facility transfer requested. Ownership changes after the new assistant accepts all transferred resources.','pending_facility_ids':user.pending_facility_ids}
+@api.post('/users/transfer-facilities/{facility_id}/cancel')
+def cancel_facility_transfer(facility_id:int,db:Session=Depends(get_db),actor:User=Depends(require_roles('coordinator','super_admin'))):
+    pending_user=None
+    for user in db.scalars(select(User)).all():
+        if facility_id in set(user.pending_facility_ids or []):
+            pending_user=user;break
+    if not pending_user: raise HTTPException(404,'No pending transfer exists for this facility')
+    pending_user.pending_facility_ids=[value for value in (pending_user.pending_facility_ids or []) if value!=facility_id]
+    for resource in db.scalars(select(FacilityResource).where(FacilityResource.facility_id==facility_id,FacilityResource.archived.is_(False))).all():
+        before=resource_snapshot(resource);resource.review_status='accepted';resource.accepted=True;resource.review_notes=None;resource.checked_by_id=None;resource.checked_at=None
+        record_resource_history(db,resource,actor,'facility_transfer_cancelled','Transfer cancelled before the requested assistant accepted ownership',before,before)
+    audit(db,actor,f'facility_transfer_cancelled:{facility_id}','user',pending_user.id)
+    db.commit();return {'message':'Facility transfer cancelled. Current owner remains unchanged.'}
+@api.post('/users/facility-transfers/{facility_id}/accept')
+def accept_facility_owner_transfer(facility_id:int,db:Session=Depends(get_db),user:User=Depends(require_roles('lab_admin'))):
+    accept_pending_facility_owner(db,user,facility_id,user)
+    db.commit()
+    return {'message':'Facility ownership accepted. Review the transferred equipment before operational use.','facility_id':facility_id}
+@api.post('/users/facility-transfers/{facility_id}/reject')
+def reject_facility_owner_transfer(facility_id:int,db:Session=Depends(get_db),user:User=Depends(require_roles('lab_admin'))):
+    if facility_id not in set(user.pending_facility_ids or []): raise HTTPException(403,'This facility ownership transfer is not pending for your account')
+    user.pending_facility_ids=[value for value in (user.pending_facility_ids or []) if value!=facility_id]
+    audit(db,user,f'facility_ownership_rejected:{facility_id}','user',user.id)
+    db.commit()
+    return {'message':'Facility ownership transfer rejected. Current owner remains unchanged.','facility_id':facility_id}
 @api.delete('/users/{user_id}',status_code=204)
 def delete_user(user_id:int,db:Session=Depends(get_db),actor:User=Depends(require_roles('dean','coordinator','super_admin'))):
     if actor.id==user_id: raise HTTPException(400,'You cannot disable your own account')
@@ -247,8 +351,9 @@ def validate_schedule(db:Session,data:dict,exclude_id:int|None=None):
 def list_schedules(db:Session=Depends(get_db),user:User=Depends(current_user)):
     query=select(Schedule).order_by(Schedule.start_at);roles={role.name for role in user.roles}
     if 'lab_admin' in roles:
-        if not user.assigned_facility_id: return {'data':[]}
-        query=query.where(Schedule.facility_id==user.assigned_facility_id)
+        ids=user_facility_ids(user)
+        if not ids: return {'data':[]}
+        query=query.where(Schedule.facility_id.in_(ids))
     return {'data':[schedule_payload(row,db) for row in db.scalars(query).all()]}
 @api.post('/schedules',status_code=201)
 def create_schedule(payload:ScheduleCreate,db:Session=Depends(get_db),user:User=Depends(require_roles('coordinator','super_admin'))):
@@ -300,15 +405,40 @@ def list_resources(facility_id:int|None=None,include_archived:bool=False,db:Sess
     if facility_id: q=q.where(FacilityResource.facility_id==facility_id)
     roles={role.name for role in user.roles}
     if not roles.intersection(MANAGEMENT_ROLES) and roles.intersection({'lab_admin','laboratory_manager','workshop_manager'}):
-        if not user.assigned_facility_id: return {'data':[]}
-        q=q.where(FacilityResource.facility_id==user.assigned_facility_id)
+        ids=user_facility_ids(user,include_pending=True)
+        if not ids: return {'data':[]}
+        q=q.where(FacilityResource.facility_id.in_(ids))
     rows=db.scalars(q.order_by(FacilityResource.updated_at.desc())).all()
     return {'data':[resource_payload(row,db) for row in rows]}
 def resource_snapshot(resource:FacilityResource):
     return {'name':resource.name,'category':resource.category,'quantity':resource.quantity,'properties':resource.properties or {},'asset_identifiers':[asset.identifier for asset in resource.assets if asset.status!='retired']}
+def resource_retired_assets(resource:FacilityResource):
+    return [{'id':asset.id,'identifier':asset.identifier,'status':asset.status,'notes':asset.notes} for asset in resource.assets if asset.status=='retired']
+def resource_change_summary(resource:FacilityResource):
+    current=resource_snapshot(resource);baseline=resource.last_accepted_snapshot or {}
+    baseline_ids=baseline.get('asset_identifiers') or []
+    current_ids=current.get('asset_identifiers') or []
+    baseline_set=set(baseline_ids);current_set=set(current_ids)
+    added=[value for value in current_ids if value not in baseline_set]
+    removed=[value for value in baseline_ids if value not in current_set]
+    unchanged=[value for value in current_ids if value in baseline_set]
+    detail_keys=('name','category','properties')
+    details_changed=not baseline or any(current.get(key)!=baseline.get(key) for key in detail_keys)
+    return {'revision':resource.revision or 1,'baseline_missing':not bool(baseline),'from_quantity':baseline.get('quantity',0),'to_quantity':current.get('quantity',0),'added_identifiers':added,'removed_identifiers':removed,'unchanged_identifiers':unchanged,'details_changed':details_changed,'baseline_name':baseline.get('name'),'baseline_category':baseline.get('category')}
+def summarize_resource_change(before:dict|None,after:dict|None):
+    before_ids=(before or {}).get('asset_identifiers') or []
+    after_ids=(after or {}).get('asset_identifiers') or []
+    added=[value for value in after_ids if value not in set(before_ids)]
+    removed=[value for value in before_ids if value not in set(after_ids)]
+    parts=[]
+    if added: parts.append(f"{len(added)} added")
+    if removed: parts.append(f"{len(removed)} removed")
+    if before and after and any(before.get(key)!=after.get(key) for key in ('name','category','properties')): parts.append('details changed')
+    return ', '.join(parts) or 'no unit changes'
 def resource_payload(resource:FacilityResource,db:Session):
     submitter=db.get(User,resource.submitted_by_id) if resource.submitted_by_id else None;reviewer=db.get(User,resource.checked_by_id) if resource.checked_by_id else None
-    return {'id':resource.id,'facility_id':resource.facility_id,'name':resource.name,'category':resource.category,'quantity':resource.quantity,'properties':resource.properties or {},'accepted':resource.accepted,'archived':resource.archived,'review_status':resource.review_status or ('accepted' if resource.accepted else 'pending'),'review_notes':resource.review_notes,'revision':resource.revision or 1,'submitted_by_id':resource.submitted_by_id,'submitted_by_name':submitter.full_name if submitter else 'System','added_by_name':added_by_name(db,'facility_resources',resource.id),'reviewed_by_name':reviewer.full_name if reviewer else None,'reviewed_at':resource.checked_at,'has_accepted_version':bool(resource.last_accepted_snapshot),'updated_at':resource.updated_at,'assets':[{'id':asset.id,'identifier':asset.identifier,'status':asset.status,'notes':asset.notes} for asset in resource.assets if asset.status!='retired']}
+    review_status=resource.review_status or ('accepted' if resource.accepted else 'pending');change=resource_change_summary(resource)
+    return {'id':resource.id,'facility_id':resource.facility_id,'name':resource.name,'category':resource.category,'quantity':resource.quantity,'properties':resource.properties or {},'accepted':resource.accepted,'archived':resource.archived,'review_status':review_status,'review_notes':resource.review_notes,'revision':resource.revision or 1,'submitted_by_id':resource.submitted_by_id,'submitted_by_name':submitter.full_name if submitter else 'System','added_by_name':added_by_name(db,'facility_resources',resource.id),'reviewed_by_name':reviewer.full_name if reviewer else None,'reviewed_at':resource.checked_at,'has_accepted_version':bool(resource.last_accepted_snapshot),'acceptance_required':not resource.archived and review_status!='accepted','pending_change':change,'pending_change_summary':summarize_resource_change(resource.last_accepted_snapshot,resource_snapshot(resource)),'updated_at':resource.updated_at,'assets':[{'id':asset.id,'identifier':asset.identifier,'status':asset.status,'notes':asset.notes} for asset in resource.assets if asset.status!='retired'],'retired_assets':resource_retired_assets(resource)}
 def record_resource_history(db:Session,resource:FacilityResource,actor:User,action:str,notes:str|None,before:dict|None,after:dict|None):
     db.add(ResourceHistory(resource_id=resource.id,facility_id=resource.facility_id,actor_id=actor.id,action=action,revision=resource.revision or 1,notes=notes,before_snapshot=before,after_snapshot=after))
 def reconcile_resource_assets(db:Session,resource:FacilityResource,identifiers:list[str]):
@@ -317,19 +447,24 @@ def reconcile_resource_assets(db:Session,resource:FacilityResource,identifiers:l
         if asset.status!='retired' and asset.identifier not in identifiers: asset.status='retired'
     for identifier in identifiers:
         if identifier in all_assets: all_assets[identifier].status='available'
-        else: db.add(ResourceAsset(resource_id=resource.id,identifier=identifier,status='available'))
+        else: resource.assets.append(ResourceAsset(resource_id=resource.id,identifier=identifier,status='available'))
     resource.quantity=len(identifiers)
 def ensure_assistant_ready(db:Session,user:User):
     if user.must_change_password: raise HTTPException(403,'Change your initial password before using the workspace')
-    if not user.assigned_facility_id: raise HTTPException(403,'No laboratory or workshop is assigned to your account')
-    unreviewed=db.scalar(select(FacilityResource.id).where(FacilityResource.facility_id==user.assigned_facility_id,FacilityResource.archived.is_(False),FacilityResource.review_status!='accepted').limit(1))
+    ids=user_facility_ids(user)
+    if not ids: raise HTTPException(403,'No laboratory or workshop is assigned to your account')
+    unreviewed=None
+    for resource in db.scalars(select(FacilityResource).where(FacilityResource.facility_id.in_(ids),FacilityResource.archived.is_(False),FacilityResource.review_status!='accepted')).all():
+        if resource.facility_id in ids and facility_has_pending_transfer(db,resource.facility_id):
+            continue
+        unreviewed=resource.id;break
     if unreviewed: raise HTTPException(403,'Review every pending or rejected resource handover before starting operational work')
 @api.post('/facility-resources',status_code=201)
 def create_resource(payload:FacilityResourceIn,db:Session=Depends(get_db),user:User=Depends(require_roles('coordinator','super_admin'))):
     if not db.get(Facility,payload.facility_id): raise HTTPException(422,'Selected facility does not exist')
     values=payload.model_dump(exclude={'asset_identifiers'});resource=FacilityResource(**values,review_status='pending',accepted=False,revision=1,submitted_by_id=user.id);db.add(resource);db.flush()
     db.add_all([ResourceAsset(resource_id=resource.id,identifier=value,status='available') for value in payload.asset_identifiers])
-    db.flush();record_resource_history(db,resource,user,'created_and_submitted','Initial resource handover submitted for assistant review',None,resource_snapshot(resource));audit(db,user,'created','facility_resources',resource.id)
+    db.flush();record_resource_history(db,resource,user,'created_and_submitted',f'Version 1 submitted with {resource.quantity} original device(s) for assistant verification',None,resource_snapshot(resource));audit(db,user,'created','facility_resources',resource.id)
     try: db.commit()
     except IntegrityError: db.rollback();raise HTTPException(409,'A serial or asset number is already registered')
     db.refresh(resource);return resource_payload(resource,db)
@@ -341,12 +476,23 @@ def update_resource(resource_id:int,payload:FacilityResourceUpdate,db:Session=De
     values=payload.model_dump(exclude_unset=True,exclude={'asset_identifiers'})
     identifiers=payload.asset_identifiers
     if identifiers is not None:
+        current_identifiers=before.get('asset_identifiers') or []
+        if resource.last_accepted_snapshot and not set(current_identifiers).issubset(set(identifiers)):
+            raise HTTPException(422,'Accepted resource units cannot be reduced or removed here. Add new units only.')
+        if resource.last_accepted_snapshot and len(identifiers)<len(current_identifiers):
+            raise HTTPException(422,'Accepted resource quantity cannot be reduced here. Add new units only.')
+        if resource.review_status=='accepted' and resource.last_accepted_snapshot and len(identifiers)==len(current_identifiers):
+            raise HTTPException(422,'Add at least one new unit before submitting another accepted resource revision.')
         expected=payload.quantity if payload.quantity is not None else len(identifiers)
         if len(identifiers)!=expected: raise HTTPException(422,'Quantity must equal the number of serial or asset identifiers')
         reconcile_resource_assets(db,resource,identifiers);values['quantity']=len(identifiers)
     for key,value in values.items(): setattr(resource,key,value)
     resource.revision=(resource.revision or 1)+1;resource.submitted_by_id=user.id;resource.review_status='pending';resource.review_notes=None;resource.accepted=False;resource.checked_by_id=None;resource.checked_at=None
-    db.flush();record_resource_history(db,resource,user,'edited_and_resubmitted','Resource details changed; assistant review is required again',before,resource_snapshot(resource));audit(db,user,'updated','facility_resources',resource.id)
+    db.flush();after=resource_snapshot(resource);summary=summarize_resource_change(before,after)
+    action='edited_and_resubmitted'
+    if 'added' in summary and 'removed' not in summary and 'details changed' not in summary: action='added_units_submitted'
+    elif 'removed' in summary and 'added' not in summary and 'details changed' not in summary: action='removed_units_submitted'
+    record_resource_history(db,resource,user,action,f'Revision {resource.revision} submitted for assistant review: {summary}',before,after);audit(db,user,'updated','facility_resources',resource.id)
     try: db.commit()
     except IntegrityError: db.rollback();raise HTTPException(409,'A serial or asset number is already registered')
     db.refresh(resource);return resource_payload(resource,db)
@@ -365,13 +511,30 @@ def review_resource(resource_id:int,payload:ResourceReviewIn,db:Session=Depends(
     if user.must_change_password: raise HTTPException(403,'Change your initial password before reviewing assigned resources')
     resource=db.get(FacilityResource,resource_id)
     if not resource: raise HTTPException(404,'Resource not found')
-    if user.assigned_facility_id!=resource.facility_id:
+    if resource.facility_id not in user_facility_ids(user,include_pending=True):
         raise HTTPException(403,'You are not assigned to this facility')
     if resource.archived: raise HTTPException(409,'Archived resources cannot be reviewed')
     if resource.review_status=='accepted': raise HTTPException(409,'This revision has already been accepted')
     before=resource_snapshot(resource);resource.review_status=payload.decision;resource.accepted=payload.decision=='accepted';resource.review_notes=payload.notes;resource.checked_by_id=user.id;resource.checked_at=datetime.now(timezone.utc)
     if resource.accepted: resource.last_accepted_snapshot=before
-    record_resource_history(db,resource,user,payload.decision,payload.notes,before,before);db.commit();db.refresh(resource);return resource_payload(resource,db)
+    review_note=payload.notes or (f'Version {resource.revision or 1} accepted and locked as current inventory' if resource.accepted else f'Version {resource.revision or 1} rejected and returned for correction')
+    record_resource_history(db,resource,user,payload.decision,review_note,before,before)
+    if resource.accepted: finalize_pending_facility_if_ready(db,user,resource.facility_id,user)
+    db.commit();db.refresh(resource);return resource_payload(resource,db)
+@api.post('/facility-resources/facilities/{facility_id}/accept-all')
+def accept_facility_transfer(facility_id:int,payload:ResourceReviewIn,db:Session=Depends(get_db),user:User=Depends(require_roles('lab_admin'))):
+    if user.must_change_password: raise HTTPException(403,'Change your initial password before accepting transferred resources')
+    if facility_id not in user_facility_ids(user): raise HTTPException(403,'Accept the facility ownership before reviewing transferred equipment')
+    resources=db.scalars(select(FacilityResource).where(FacilityResource.facility_id==facility_id,FacilityResource.archived.is_(False))).all()
+    if not resources: raise HTTPException(404,'No active resources found for this facility')
+    pending=[resource for resource in resources if resource.review_status!='accepted']
+    if not pending: raise HTTPException(409,'No resource handover is waiting for acceptance in this facility')
+    for resource in pending:
+        before=resource_snapshot(resource);resource.review_status='accepted';resource.accepted=True;resource.review_notes=payload.notes;resource.checked_by_id=user.id;resource.checked_at=datetime.now(timezone.utc);resource.last_accepted_snapshot=before
+        record_resource_history(db,resource,user,'accepted',payload.notes or f'Facility resource group accepted with version {resource.revision or 1}',before,before)
+    finalize_pending_facility_if_ready(db,user,facility_id,user)
+    db.commit()
+    return {'message':'Facility handover accepted. All pending resource versions are now current.','facility_id':facility_id,'accepted_resources':len(pending)}
 @api.post('/facility-resources/{resource_id}/resubmit')
 def resubmit_resource(resource_id:int,payload:ResourceActionIn,db:Session=Depends(get_db),user:User=Depends(require_roles('coordinator','super_admin'))):
     resource=db.get(FacilityResource,resource_id)
@@ -394,7 +557,7 @@ def resource_history(resource_id:int,db:Session=Depends(get_db),user:User=Depend
     resource=db.get(FacilityResource,resource_id)
     if not resource: raise HTTPException(404,'Resource not found')
     roles={role.name for role in user.roles}
-    if not roles.intersection(MANAGEMENT_ROLES) and user.assigned_facility_id!=resource.facility_id: raise HTTPException(403,'You cannot view this resource history')
+    if not roles.intersection(MANAGEMENT_ROLES) and resource.facility_id not in user_facility_ids(user,include_pending=True): raise HTTPException(403,'You cannot view this resource history')
     rows=db.scalars(select(ResourceHistory).where(ResourceHistory.resource_id==resource.id).order_by(ResourceHistory.created_at.desc(),ResourceHistory.id.desc())).all()
     return {'data':[{'id':row.id,'action':row.action,'revision':row.revision,'notes':row.notes,'before_snapshot':row.before_snapshot,'after_snapshot':row.after_snapshot,'created_at':row.created_at,'actor_id':row.actor_id,'actor_name':db.get(User,row.actor_id).full_name if row.actor_id and db.get(User,row.actor_id) else 'System'} for row in rows]}
 @api.get('/equipment-usage-requests')
@@ -403,15 +566,24 @@ def list_usage_requests(db:Session=Depends(get_db),user:User=Depends(current_use
     q=select(EquipmentUsageRequest).order_by(EquipmentUsageRequest.created_at.desc())
     if not roles.intersection(MANAGEMENT_ROLES): q=q.where(EquipmentUsageRequest.requester_id==user.id)
     rows=db.scalars(q).all()
-    return {'data':[{'id':row.id,'resource_id':row.resource_id,'facility_id':row.facility_id,'requester_id':row.requester_id,'quantity':row.quantity,'usage_type':row.usage_type,'purpose':row.purpose,'status':row.status,'decision_notes':row.decision_notes,'approver_id':row.approver_id,'decided_at':row.decided_at,'created_at':row.created_at} for row in rows]}
+    return {'data':[{'id':row.id,'resource_id':row.resource_id,'facility_id':row.facility_id,'requester_id':row.requester_id,'quantity':row.quantity,'usage_type':row.usage_type,'purpose':row.purpose,'asset_ids':row.asset_ids or [],'asset_identifiers':row.asset_identifiers or [],'status':row.status,'decision_notes':row.decision_notes,'approver_id':row.approver_id,'decided_at':row.decided_at,'created_at':row.created_at} for row in rows]}
 @api.post('/equipment-usage-requests',status_code=201)
 def create_usage_request(payload:EquipmentUsageCreate,db:Session=Depends(get_db),user:User=Depends(require_roles('lab_admin'))):
     ensure_assistant_ready(db,user)
     resource=db.get(FacilityResource,payload.resource_id)
     if not resource or resource.archived: raise HTTPException(404,'Active resource not found')
-    if user.assigned_facility_id!=resource.facility_id: raise HTTPException(403,'You may only request resources from your assigned facility')
+    if resource.facility_id not in user_facility_ids(user): raise HTTPException(403,'You may only request resources from your assigned facility')
     if payload.quantity>resource.quantity: raise HTTPException(422,'Requested quantity exceeds available inventory')
-    request=EquipmentUsageRequest(resource_id=resource.id,facility_id=resource.facility_id,requester_id=user.id,quantity=payload.quantity,usage_type=payload.usage_type,purpose=payload.purpose)
+    selected_assets=[]
+    if payload.asset_ids:
+        pending_rows=db.scalars(select(EquipmentUsageRequest).where(EquipmentUsageRequest.resource_id==resource.id,EquipmentUsageRequest.status==Status.pending)).all()
+        already_requested={asset_id for row in pending_rows for asset_id in (row.asset_ids or [])}
+        for asset_id in payload.asset_ids:
+            asset=db.get(ResourceAsset,asset_id)
+            if not asset or asset.resource_id!=resource.id or asset.status=='retired': raise HTTPException(422,'Selected serial number is not available for this resource')
+            if asset_id in already_requested: raise HTTPException(409,f'{asset.identifier} already has a pending usage request')
+            selected_assets.append(asset)
+    request=EquipmentUsageRequest(resource_id=resource.id,facility_id=resource.facility_id,requester_id=user.id,quantity=payload.quantity,usage_type=payload.usage_type,purpose=payload.purpose,asset_ids=[asset.id for asset in selected_assets],asset_identifiers=[asset.identifier for asset in selected_assets])
     db.add(request);db.commit();db.refresh(request);return request
 @api.patch('/equipment-usage-requests/{request_id}/decision')
 def decide_usage_request(request_id:int,payload:EquipmentUsageDecision,db:Session=Depends(get_db),user:User=Depends(require_roles('coordinator','super_admin'))):
@@ -419,13 +591,24 @@ def decide_usage_request(request_id:int,payload:EquipmentUsageDecision,db:Sessio
     if not request: raise HTTPException(404,'Usage request not found')
     if request.status!=Status.pending: raise HTTPException(409,'This request has already been decided')
     resource=db.get(FacilityResource,request.resource_id)
+    before=resource_snapshot(resource) if resource else None
     if payload.decision=='approved':
         if not resource or resource.quantity<request.quantity: raise HTTPException(409,'Insufficient resource quantity for approval')
         resource.quantity-=request.quantity
+        for asset_id in request.asset_ids or []:
+            asset=db.get(ResourceAsset,asset_id)
+            if asset and asset.resource_id==resource.id:
+                asset.status='retired';asset.notes=f'{request.usage_type} by approved usage request #{request.id}'
         if resource.quantity==0: resource.archived=True
         request.status=Status.approved
     else: request.status=Status.rejected
-    request.approver_id=user.id;request.decision_notes=payload.notes;request.decided_at=datetime.now(timezone.utc);db.commit();db.refresh(request);return request
+    request.approver_id=user.id;request.decision_notes=payload.notes;request.decided_at=datetime.now(timezone.utc)
+    if payload.decision=='approved' and resource:
+        db.flush()
+        serials=', '.join(request.asset_identifiers or [])
+        notes=f'Approved {request.usage_type} usage request #{request.id}: {serials or str(request.quantity)+" quantity-only unit(s)"}'
+        record_resource_history(db,resource,user,f'usage_{request.usage_type}',notes,before,resource_snapshot(resource))
+    db.commit();db.refresh(request);return request
 def maintenance_event(db:Session,item:MaintenanceRequest,actor:User,action:str,old:Status|str|None,new:Status|str|None,notes:str|None=None):
     db.add(MaintenanceHistory(request_id=item.id,actor_id=actor.id,action=action,from_status=old.value if isinstance(old,Status) else old,to_status=new.value if isinstance(new,Status) else new,notes=notes))
 @api.get('/maintenance-workflow')
@@ -441,7 +624,7 @@ def create_maintenance_workflow(payload:MaintenanceWorkflowCreate,db:Session=Dep
     ensure_assistant_ready(db,user)
     resource=db.get(FacilityResource,payload.resource_id)
     if not resource: raise HTTPException(404,'Resource not found')
-    if user.assigned_facility_id!=resource.facility_id: raise HTTPException(403,'Resource is not in your assigned facility')
+    if resource.facility_id not in user_facility_ids(user): raise HTTPException(403,'Resource is not in your assigned facility')
     assets=[]
     for asset_id in payload.asset_ids:
         asset=db.get(ResourceAsset,asset_id)
@@ -470,7 +653,7 @@ def asset_maintenance_history(asset_id:int,db:Session=Depends(get_db),user:User=
     asset=db.get(ResourceAsset,asset_id)
     if not asset: raise HTTPException(404,'Asset not found')
     resource=db.get(FacilityResource,asset.resource_id);roles={role.name for role in user.roles}
-    if not roles.intersection(MANAGEMENT_ROLES) and user.assigned_facility_id!=resource.facility_id and 'maintainer' not in roles: raise HTTPException(403,'You cannot view this asset history')
+    if not roles.intersection(MANAGEMENT_ROLES) and resource.facility_id not in user_facility_ids(user,include_pending=True) and 'maintainer' not in roles: raise HTTPException(403,'You cannot view this asset history')
     requests=db.scalars(select(MaintenanceRequest).where(MaintenanceRequest.asset_id==asset.id).order_by(MaintenanceRequest.created_at.desc())).all()
     return {'asset':{'id':asset.id,'identifier':asset.identifier,'status':asset.status},'resource':{'id':resource.id,'name':resource.name},'data':[{'id':item.id,'title':item.title,'details':item.details,'priority':item.priority,'status':item.status,'resolution':item.resolution,'completion_notes':item.completion_notes,'assistant_verification':item.assistant_verification,'created_at':item.created_at,'events':[{'id':event.id,'action':event.action,'from_status':event.from_status,'to_status':event.to_status,'notes':event.notes,'created_at':event.created_at,'actor_name':db.get(User,event.actor_id).full_name if db.get(User,event.actor_id) else 'System'} for event in db.scalars(select(MaintenanceHistory).where(MaintenanceHistory.request_id==item.id).order_by(MaintenanceHistory.created_at)).all()]} for item in requests]}
 @api.post('/maintenance-workflow/{request_id}/approve')
