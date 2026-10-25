@@ -72,6 +72,29 @@ export function RoleOverview({user}:{user:SessionUser}){
           ],
           notes:[`${facilities.data.filter(item=>item.kind==='laboratory').length} laboratories and ${facilities.data.filter(item=>item.kind==='workshop').length} workshops are registered.`, pendingUsage.length?'Equipment usage requests need a decision.':'No pending equipment usage requests.'],
         })
+      }else if(has(user,'chair')&&!has(user,'store_manager')){
+        const result=await api<{data:{reference:string;requester_name:string;status:string}[];meta:{total:number}}>('/store/requests?limit=100')
+        const pending=result.data.filter(item=>item.status==='chair_review')
+        if(mounted)setData({metrics:[{label:'Assigned requests',value:result.meta.total,detail:'addressed to you'},{label:'Awaiting confirmation',value:pending.length,detail:'send to dean after review'}],primary:pending.slice(0,5).map(item=>({title:item.reference,meta:item.requester_name,status:'confirm request'})),secondary:[],notes:[]})
+      }else if(has(user,'store_manager')){
+        const[stores,requests,report]=await Promise.all([
+          api<{id:number;name:string;review_status:string}[]>('/store/stores'),
+          api<{data:{reference:string;requester_name:string;facility_name:string|null;status:string}[];meta:{total:number}}>('/store/requests?limit=100'),
+          api<{summary:{on_hand:number;outstanding_loans:number;overdue:number}}>('/store/report'),
+        ])
+        const needsAction=requests.data.filter(item=>item.status==='ready')
+        const pendingStores=stores.filter(item=>item.review_status==='pending')
+        if(mounted)setData({
+          metrics:[
+            {label:'Available units',value:report.summary.on_hand,detail:'accepted store stock'},
+            {label:'Requests',value:requests.meta.total,detail:'material requests'},
+            {label:'Outstanding loans',value:report.summary.outstanding_loans,detail:'durable units to return'},
+            {label:'Overdue loans',value:report.summary.overdue,detail:'borrowers to follow up'},
+          ],
+          primary:needsAction.slice(0,5).map(item=>({title:item.reference,meta:item.requester_name,status:label(item.status)})),
+          secondary:pendingStores.slice(0,5).map(item=>({title:item.name,meta:'Inventory handover',status:'check store'})),
+          notes:[`${stores.length} store${stores.length===1?'':'s'} visible to this account.`],
+        })
       }else if(has(user,'lab_admin','laboratory_manager','workshop_manager')){
         const[r,u,m]=await Promise.all([api<{data:{facility_id:number;review_status:string;name:string;quantity:number;acceptance_required:boolean;pending_change_summary:string}[]}>('/facility-resources'),api<{data:{status:string;purpose:string;quantity:number}[]}>('/equipment-usage-requests'),api<{data:{status:string;assistant_verification:string|null;title:string;asset_identifier:string|null}[]}>('/maintenance-workflow')])
         const facilityIds=activeFacilityIds(user)
@@ -85,7 +108,7 @@ export function RoleOverview({user}:{user:SessionUser}){
       }else if(mounted)setData(emptyState)
     }finally{if(mounted)setLoading(false)}
   }void load();return()=>{mounted=false}},[role,user.assigned_facility_id,user.assigned_facility_ids?.join(','),user.pending_facility_ids?.join(',')])
-  return <div className="overview role-overview"><p className="eyebrow">{role.replaceAll('_',' ').toUpperCase()} OVERVIEW</p><h2>Welcome, {user.full_name.split(' ')[0]}</h2><p className="subcopy">{has(user,'dean')?'Your desk focuses on project decisions, coordinator oversight, schedules, and institutional reports.':has(user,'coordinator','super_admin')?'Your desk shows operational work needing action across users, facilities, resources, scheduling, and maintenance.':'Your summary is based on your assigned responsibilities and access.'}</p>{!has(user,'dean','coordinator','super_admin')&&<AssignedFacilityPanel user={user}/>}<div className="metrics">{data.metrics.map(x=><div className="metric" key={x.label}><span>{x.label}</span><strong>{x.value}</strong><p>{x.detail}</p></div>)}</div>{loading&&<p className="overview-loading">Loading overview...</p>}{!loading&&<div className="overview-action-grid"><OverviewPanel title={has(user,'dean')?'Needs Dean Decision':has(user,'coordinator','super_admin')?'Needs Coordinator Action':'Needs Attention'} items={data.primary}/><OverviewPanel title={has(user,'dean')?'Schedule Awareness':has(user,'coordinator','super_admin')?'Operational Follow-up':'Recent Status'} items={data.secondary}/>{data.notes.length>0&&<section className="overview-panel overview-notes"><h3>Basic Information</h3>{data.notes.map(note=><p key={note}>{note}</p>)}</section>}</div>}</div>
+  return <div className="overview role-overview"><p className="eyebrow">{role.replaceAll('_',' ').toUpperCase()} OVERVIEW</p><h2>Welcome, {user.full_name.split(' ')[0]}</h2><p className="subcopy">{has(user,'dean')?'Your desk focuses on project decisions, coordinator oversight, schedules, and institutional reports.':has(user,'coordinator','super_admin')?'Your desk shows operational work needing action across users, facilities, resources, scheduling, and maintenance.':'Your summary is based on your assigned responsibilities and access.'}</p>{!has(user,'dean','coordinator','super_admin','store_manager','chair')&&<AssignedFacilityPanel user={user}/>}<div className="metrics">{data.metrics.map(x=><div className="metric" key={x.label}><span>{x.label}</span><strong>{x.value}</strong><p>{x.detail}</p></div>)}</div>{loading&&<p className="overview-loading">Loading overview...</p>}{!loading&&<div className="overview-action-grid"><OverviewPanel title={has(user,'dean')?'Needs Dean Decision':has(user,'coordinator','super_admin')?'Needs Coordinator Action':'Needs Attention'} items={data.primary}/><OverviewPanel title={has(user,'dean')?'Schedule Awareness':has(user,'coordinator','super_admin')?'Operational Follow-up':'Recent Status'} items={data.secondary}/>{data.notes.length>0&&<section className="overview-panel overview-notes"><h3>Basic Information</h3>{data.notes.map(note=><p key={note}>{note}</p>)}</section>}</div>}</div>
 }
 
 function OverviewPanel({title,items}:{title:string;items:ActionItem[]}){

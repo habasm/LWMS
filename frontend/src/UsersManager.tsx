@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from './lib/api'
 import type { Page } from './lib/api'
+import { ChairAccessPanel } from './ChairAccessPanel'
 import './facility-actions.css'
 import './facility-manager.css'
 
@@ -11,11 +12,11 @@ type Activity={id:number;action:string;actor_name:string;created_at:string}
 type User={id:number;full_name:string;email:string;is_active:boolean;must_change_password:boolean;assigned_facility_id:number|null;assigned_facility_ids?:number[];assigned_facilities?:Facility[];pending_facility_ids?:number[];pending_facilities?:Facility[];outgoing_pending_facilities?:Facility[];role_names:string[];added_by_name:string;activity?:Activity[]}
 
 const PAGE_SIZE=10
-const roleLabels:Record<string,string>={lab_admin:'facility assistant',maintainer:'maintainer',coordinator:'coordinator'}
+const roleLabels:Record<string,string>={lab_admin:'facility assistant',maintainer:'maintainer',coordinator:'coordinator',store_manager:'store man',chair:'department chair'}
 const roleLabel=(name:string)=>roleLabels[name]??name.replaceAll('_',' ')
 const actionLabel=(value:string)=>value.split(':')[0].replaceAll('_',' ')
 
-export function UsersManager(){
+export function UsersManager({canManageChair=false}:{canManageChair?:boolean}){
   const[users,setUsers]=useState<User[]>([])
   const[assistantOptions,setAssistantOptions]=useState<User[]>([])
   const[roles,setRoles]=useState<Role[]>([])
@@ -47,7 +48,7 @@ export function UsersManager(){
   useEffect(()=>{void load(page,search,status)},[page,status])
   useEffect(()=>{const id=setTimeout(()=>{setPage(1);void load(1,search,status)},250);return()=>clearTimeout(id)},[search])
 
-  function beginEdit(user:User){setEditing(user);setRole(user.role_names[0]??'');setFacilityIds(user.assigned_facility_ids?.length?user.assigned_facility_ids:(user.assigned_facility_id?[user.assigned_facility_id]:[]))}
+  function beginEdit(user:User){setEditing(user);setRole(user.role_names.find(name=>name!=='chair')??'chair');setFacilityIds(user.assigned_facility_ids?.length?user.assigned_facility_ids:(user.assigned_facility_id?[user.assigned_facility_id]:[]))}
   function cancelEdit(){setEditing(null);setRole('');setFacilityIds([])}
   function toggleFacility(id:number,checked:boolean){setFacilityIds(current=>checked?[...new Set([...current,id])]:current.filter(value=>value!==id))}
   const needsFacility=role==='lab_admin'
@@ -57,7 +58,8 @@ export function UsersManager(){
   async function save(event:FormEvent<HTMLFormElement>){
     event.preventDefault()
     const form=event.currentTarget,data=new FormData(form)
-    const payload={full_name:data.get('full_name'),email:data.get('email'),role_names:[role],assigned_facility_ids:needsFacility?facilityIds:[],is_active:data.get('is_active')==='on'}
+    const role_names=role==='chair'?['chair']:[role,...(editing?.role_names.includes('chair')?['chair']:[])]
+    const payload={full_name:data.get('full_name'),email:data.get('email'),role_names,assigned_facility_ids:needsFacility?facilityIds:[],is_active:data.get('is_active')==='on'}
     try{
       await api(editing?`/users/${editing.id}`:'/users',{method:editing?'PATCH':'POST',body:JSON.stringify(payload)})
       const first=String(payload.full_name).trim().split(/\s+/)[0].toLowerCase()
@@ -82,6 +84,7 @@ export function UsersManager(){
 
   return <div className="admin-module">
     <div className="module-heading"><p className="eyebrow">ACCESS CONTROL / USERS</p><h2>People & roles</h2><p>Create accounts, assign assistants to facilities, and transfer facility ownership by assistant acceptance.</p></div>
+    {canManageChair&&<ChairAccessPanel onChanged={()=>{void load()}}/>}
     <div className="module-grid">
       <section className="panel form-panel">
         <h3>{editing?'Edit user':'Add a user'}</h3>
@@ -89,7 +92,7 @@ export function UsersManager(){
           <label>Full name<input name="full_name" defaultValue={editing?.full_name} required/></label>
           <label>Email address<input name="email" type="email" defaultValue={editing?.email} required/></label>
           <label>Role<select value={role} onChange={e=>{setRole(e.target.value);setFacilityIds([])}} required><option value="">Choose role</option>{roles.map(r=><option key={r.id} value={r.name}>{roleLabel(r.name)}</option>)}</select></label>
-          {needsFacility&&<fieldset className="facility-checkboxes"><legend>Assigned facilities</legend><p>An assistant can work in more than one laboratory or workshop.</p>{facilities.map(f=><label key={f.id}><input type="checkbox" checked={facilityIds.includes(f.id)} onChange={e=>toggleFacility(f.id,e.target.checked)}/><span>{f.name}</span><em>{f.kind}</em></label>)}</fieldset>}
+          {needsFacility&&<fieldset className="facility-checkboxes"><legend>Assigned facilities</legend><p>An assistant can work in more than one laboratory or workshop.</p>{facilities.map(f=><label key={f.id}><input type="checkbox" checked={facilityIds.includes(f.id)} onChange={e=>toggleFacility(f.id,e.target.checked)}/><span>{f.name}</span><em>{f.kind}</em></label>)}</fieldset>}{role==='store_manager'&&<p>Assign this account to a store from Materials store after creating it.</p>}
           <label className="check-label"><input name="is_active" type="checkbox" defaultChecked={editing?.is_active??true}/> Active account</label>
           <div className="form-actions"><button className="primary" disabled={needsFacility&&facilityIds.length===0}>{editing?'Update user':'Create user'}</button>{editing&&<button type="button" className="secondary" onClick={cancelEdit}>Cancel</button>}</div>
         </form>}

@@ -1,4 +1,5 @@
 from datetime import datetime, time, timedelta
+from sqlalchemy import select
 
 from .core.database import SessionLocal
 from .core.security import hash_password
@@ -19,7 +20,7 @@ from .models import (
     User,
 )
 
-ROLES = ['dean', 'coordinator', 'super_admin', 'lab_admin', 'maintainer']
+ROLES = ['dean', 'coordinator', 'super_admin', 'lab_admin', 'maintainer', 'store_manager', 'chair']
 DEMO_PASSWORD = 'Demo123!'
 
 USERS = [
@@ -91,6 +92,13 @@ def maintenance_event(db, item: MaintenanceRequest, actor: User, action: str, ol
 def seed() -> None:
     db = SessionLocal()
     try:
+        if db.scalar(select(User.id).limit(1)) is not None:
+            existing = set(db.scalars(select(Role.name)).all())
+            for name in ROLES:
+                if name not in existing:
+                    db.add(Role(name=name, permissions='[]'))
+            db.commit()
+            return
         now = datetime.now().replace(minute=0, second=0, microsecond=0)
         role_map: dict[str, Role] = {}
         for name in ROLES:

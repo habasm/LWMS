@@ -46,3 +46,103 @@ class Notification(Base, Timestamped):
     __tablename__='notifications'; id: Mapped[int]=mapped_column(primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey('users.id')); message: Mapped[str]=mapped_column(String(255)); read: Mapped[bool]=mapped_column(Boolean,default=False)
 class AuditLog(Base):
     __tablename__='audit_logs'; id: Mapped[int]=mapped_column(primary_key=True); actor_id: Mapped[int|None]=mapped_column(ForeignKey('users.id')); action: Mapped[str]=mapped_column(String(80)); entity: Mapped[str]=mapped_column(String(80)); entity_id: Mapped[int|None]; created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+
+class StoreItem(Base, Timestamped):
+    __tablename__='store_items'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    name: Mapped[str]=mapped_column(String(150),index=True)
+    category: Mapped[str]=mapped_column(String(80))
+    kind: Mapped[str]=mapped_column(String(20))  # consumable or durable
+    unit: Mapped[str]=mapped_column(String(40),default='each')
+    description: Mapped[str|None]=mapped_column(Text)
+
+class Store(Base, Timestamped):
+    __tablename__='stores'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    name: Mapped[str]=mapped_column(String(150),unique=True)
+    location: Mapped[str]=mapped_column(String(150))
+    description: Mapped[str|None]=mapped_column(Text)
+    manager_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    created_by_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    review_status: Mapped[str]=mapped_column(String(20),default='unassigned')
+    revision: Mapped[int]=mapped_column(Integer,default=1)
+    accepted_by_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    accepted_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+
+class StoreLot(Base, Timestamped):
+    __tablename__='store_lots'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    item_id: Mapped[int]=mapped_column(ForeignKey('store_items.id'),index=True)
+    facility_id: Mapped[int|None]=mapped_column(ForeignKey('facilities.id'),index=True)
+    store_id: Mapped[int]=mapped_column(ForeignKey('stores.id'),index=True)
+    quantity: Mapped[int]=mapped_column(Integer)
+    available: Mapped[int]=mapped_column(Integer)
+    status: Mapped[str]=mapped_column(String(20),default='pending')
+    purchase_reference: Mapped[str]=mapped_column(String(120))
+    supplier: Mapped[str|None]=mapped_column(String(150))
+    received_by_id: Mapped[int]=mapped_column(ForeignKey('users.id'))
+    accepted_by_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    accepted_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+
+class StoreRequest(Base, Timestamped):
+    __tablename__='store_requests'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    reference: Mapped[str]=mapped_column(String(40),unique=True,index=True)
+    requester_name: Mapped[str]=mapped_column(String(150))
+    requester_contact: Mapped[str]=mapped_column(String(160))
+    department: Mapped[str]=mapped_column(String(150))
+    purpose: Mapped[str]=mapped_column(Text)
+    kind: Mapped[str]=mapped_column(String(20))
+    requester_position: Mapped[str]=mapped_column(String(20),default='staff')
+    chair_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    status: Mapped[str]=mapped_column(String(30),default='pending')
+    facility_id: Mapped[int|None]=mapped_column(ForeignKey('facilities.id'))
+    store_id: Mapped[int]=mapped_column(ForeignKey('stores.id'),index=True)
+    chair_name: Mapped[str|None]=mapped_column(String(150))
+    dean_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    assigned_by_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    assigned_manager_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    issued_by_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    issued_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+    signed_document: Mapped[str|None]=mapped_column(String(255))
+    notes: Mapped[str|None]=mapped_column(Text)
+
+class StoreRequestLine(Base):
+    __tablename__='store_request_lines'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    request_id: Mapped[int]=mapped_column(ForeignKey('store_requests.id'),index=True)
+    item_id: Mapped[int]=mapped_column(ForeignKey('store_items.id'))
+    quantity: Mapped[int]=mapped_column(Integer)
+    returned: Mapped[int]=mapped_column(Integer,default=0)
+
+class StoreAllocation(Base):
+    __tablename__='store_allocations'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    line_id: Mapped[int]=mapped_column(ForeignKey('store_request_lines.id'),index=True)
+    lot_id: Mapped[int]=mapped_column(ForeignKey('store_lots.id'),index=True)
+    quantity: Mapped[int]=mapped_column(Integer)
+    returned: Mapped[int]=mapped_column(Integer,default=0)
+
+class StoreMovement(Base):
+    __tablename__='store_movements'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    store_id: Mapped[int]=mapped_column(ForeignKey('stores.id'),index=True)
+    item_id: Mapped[int]=mapped_column(ForeignKey('store_items.id'))
+    lot_id: Mapped[int]=mapped_column(ForeignKey('store_lots.id'))
+    request_id: Mapped[int|None]=mapped_column(ForeignKey('store_requests.id'))
+    actor_id: Mapped[int]=mapped_column(ForeignKey('users.id'))
+    action: Mapped[str]=mapped_column(String(20))
+    quantity: Mapped[int]=mapped_column(Integer)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())
+
+class StoreEvent(Base):
+    __tablename__='store_events'
+    id: Mapped[int]=mapped_column(primary_key=True)
+    request_id: Mapped[int|None]=mapped_column(ForeignKey('store_requests.id'),index=True)
+    lot_id: Mapped[int|None]=mapped_column(ForeignKey('store_lots.id'),index=True)
+    store_id: Mapped[int|None]=mapped_column(ForeignKey('stores.id'),index=True)
+    actor_id: Mapped[int|None]=mapped_column(ForeignKey('users.id'))
+    action: Mapped[str]=mapped_column(String(40))
+    notes: Mapped[str|None]=mapped_column(Text)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),server_default=func.now())

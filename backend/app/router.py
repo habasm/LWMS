@@ -1,5 +1,6 @@
 from datetime import date, datetime, time, timezone
 from typing import Any, Type
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -14,7 +15,9 @@ api=APIRouter(prefix='/api/v1')
 COORDINATOR_ROLES={'coordinator','super_admin'}
 DEAN_ROLES={'dean'}
 MANAGEMENT_ROLES=COORDINATOR_ROLES|DEAN_ROLES
-OPERATIONAL_USER_ROLES={'lab_admin','maintainer'}
+OPERATIONAL_USER_ROLES={'lab_admin','maintainer','store_manager','chair'}
+class ChairAccessIn(BaseModel):
+    enabled: bool
 def has_any(user:User,names:set[str]): return bool({role.name for role in user.roles}.intersection(names))
 def role_names(user:User): return {role.name for role in user.roles}
 def user_facility_ids(user:User,include_pending:bool=False):
@@ -24,6 +27,14 @@ def user_facility_ids(user:User,include_pending:bool=False):
     return ids
 def set_user_facility_ids(user:User,ids:set[int]):
     cleaned=sorted(ids);user.assigned_facility_ids=cleaned;user.assigned_facility_id=cleaned[0] if cleaned else None
+def validate_user_facilities(db:Session,role_set:set[str],facility_ids:set[int],exclude_user_id:int|None=None):
+    if not facility_ids: return
+    if 'store_manager' in role_set:
+        raise HTTPException(422,'Assign store managers from the Store page, not facility ownership')
+    if 'lab_admin' in role_set:
+        for facility_id in facility_ids:
+            if not db.get(Facility,facility_id): raise HTTPException(422,'Selected facility does not exist')
+    else: raise HTTPException(422,'Facilities can only be assigned to a facility assistant')
 def facility_payload(db:Session,facility_id:int):
     facility=db.get(Facility,facility_id)
     return {'id':facility.id,'name':facility.name,'kind':facility.kind,'location':facility.location,'capacity':facility.capacity} if facility else None
@@ -58,10 +69,11 @@ def outgoing_pending_facilities(db:Session,user:User):
         if other.id!=user.id: pending.update(owned.intersection(set(other.pending_facility_ids or [])))
     return pending
 def ensure_user_role_scope(actor:User,target_roles:set[str],target:User|None=None):
+    if {'lab_admin','store_manager'}.issubset(target_roles): raise HTTPException(422,'Use separate accounts for facility assistants and store managers')
     if has_any(actor,DEAN_ROLES):
         if target_roles!={'coordinator'}: raise HTTPException(403,'Dean can only manage coordinator accounts')
     elif has_any(actor,COORDINATOR_ROLES):
-        if not target_roles or not target_roles.issubset(OPERATIONAL_USER_ROLES): raise HTTPException(403,'Coordinator can only manage facility assistants and maintainers')
+        if not target_roles or not target_roles.issubset(OPERATIONAL_USER_ROLES): raise HTTPException(403,'Coordinator can only manage operational accounts')
         if target and not role_names(target).issubset(OPERATIONAL_USER_ROLES): raise HTTPException(403,'This protected account cannot be changed from the coordinator workspace')
 admin=Depends(require_roles('coordinator','super_admin','laboratory_manager','workshop_manager','lab_admin'))
 def page(db:Session, model:Type[Any], skip:int, limit:int, search:str|None=None):
@@ -112,6 +124,24 @@ def change_password(payload:PasswordChange,user:User=Depends(current_user),db:Se
 def roles(db:Session=Depends(get_db),user:User=Depends(require_roles('dean','coordinator','super_admin'))):
     if has_any(user,DEAN_ROLES): return db.scalars(select(Role).where(Role.name=='coordinator')).all()
     return db.scalars(select(Role).where(Role.name.in_(OPERATIONAL_USER_ROLES)).order_by(Role.name)).all()
+@api.get('/users/chair-access')
+def chair_access_users(db:Session=Depends(get_db),actor:User=Depends(require_roles('coordinator','super_admin'))):
+    return [{'id':user.id,'full_name':user.full_name,'email':user.email,'is_active':user.is_active,
+             'has_chair_access':'chair' in role_names(user)}
+            for user in db.scalars(select(User).order_by(User.full_name)).all()]
+@api.put('/users/{user_id}/chair-access')
+def set_chair_access(user_id:int,payload:ChairAccessIn,db:Session=Depends(get_db),actor:User=Depends(require_roles('coordinator','super_admin'))):
+    user=db.get(User,user_id)
+    if not user: raise HTTPException(404,'User not found')
+    chair=db.scalar(select(Role).where(Role.name=='chair'))
+    if not chair: raise HTTPException(409,'Chair role is not installed')
+    current='chair' in role_names(user)
+    if current==payload.enabled: return {'id':user.id,'has_chair_access':current}
+    if not payload.enabled and len(user.roles)==1: raise HTTPException(409,'Assign another role before removing this account\'s only role')
+    user.roles=[*user.roles,chair] if payload.enabled else [role for role in user.roles if role.name!='chair']
+    audit(db,actor,'chair_access_granted' if payload.enabled else 'chair_access_removed','user',user.id)
+    db.commit()
+    return {'id':user.id,'has_chair_access':payload.enabled}
 @api.get('/users')
 def users(skip:int=0,limit:int=Query(25,le=100),search:str|None=None,active:str='active',db:Session=Depends(get_db),user:User=Depends(require_roles('dean','coordinator','super_admin'))):
     all_users=db.scalars(select(User).order_by(User.full_name)).all()
@@ -132,15 +162,13 @@ def create_user(payload:UserCreate,db:Session=Depends(get_db),actor:User=Depends
     # Administrators may set a temporary password, otherwise use first-name + password.
     # Every provisioned account must update this initial credential on first login.
     selected_facility_ids=set(payload.assigned_facility_ids or ([] if payload.assigned_facility_id is None else [payload.assigned_facility_id]))
-    if selected_facility_ids:
-        if 'lab_admin' not in payload.role_names: raise HTTPException(422,'Facilities can only be assigned to a facility assistant')
-        for facility_id in selected_facility_ids:
-            if not db.get(Facility,facility_id): raise HTTPException(422,'Selected facility does not exist')
+    validate_user_facilities(db,set(payload.role_names),selected_facility_ids)
     default_password=f"{payload.full_name.strip().split()[0].lower()}password"
     user=User(email=payload.email,full_name=payload.full_name,password_hash=hash_password(payload.password or default_password),must_change_password=True,roles=roles); db.add(user);db.flush()
     if selected_facility_ids:
         set_user_facility_ids(user,selected_facility_ids)
-        for facility_id in selected_facility_ids: require_new_assistant_handover(db,facility_id,actor,user)
+        if 'lab_admin' in payload.role_names:
+            for facility_id in selected_facility_ids: require_new_assistant_handover(db,facility_id,actor,user)
     audit(db,actor,'created','user',user.id)
     db.commit();db.refresh(user);return user
 @api.patch('/users/{user_id}',response_model=UserOut)
@@ -166,16 +194,14 @@ def update_user(user_id:int,payload:UserUpdate,db:Session=Depends(get_db),actor:
     else:
         selected_facility_ids=previous_facility_ids
     selected_role_names=requested_role_names if requested_role_names is not None else [role.name for role in user.roles]
-    if selected_facility_ids:
-        if 'lab_admin' not in selected_role_names: raise HTTPException(422,'Facilities can only be assigned to a facility assistant')
-        for facility_id in selected_facility_ids:
-            if not db.get(Facility,facility_id): raise HTTPException(422,'Selected facility does not exist')
+    validate_user_facilities(db,set(selected_role_names),selected_facility_ids,user.id)
     for managed in db.scalars(select(Facility).where(Facility.manager_id==user.id)).all(): managed.manager_id=None
     if 'assigned_facility_id' in data: data.pop('assigned_facility_id')
     for key,value in data.items(): setattr(user,key,value)
     if selected_facility_ids!=previous_facility_ids:
         set_user_facility_ids(user,selected_facility_ids)
-        for facility_id in selected_facility_ids-previous_facility_ids: require_new_assistant_handover(db,facility_id,actor,user)
+        if 'lab_admin' in selected_role_names:
+            for facility_id in selected_facility_ids-previous_facility_ids: require_new_assistant_handover(db,facility_id,actor,user)
     audit(db,actor,'updated','user',user.id)
     try: db.commit()
     except IntegrityError:

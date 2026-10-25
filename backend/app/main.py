@@ -8,10 +8,12 @@ from .core.config import settings
 from .core.database import Base, engine
 from . import models
 from .router import api
+from .store import store
 from .seed import seed
 app=FastAPI(title='LWMS API',version='1.0.0',description='Laboratory and Workshop Management System')
 app.add_middleware(CORSMiddleware,allow_origins=settings().origins,allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
 app.include_router(api)
+app.include_router(store)
 @app.get('/health',tags=['health'])
 def health(): return {'status':'ok'}
 @app.on_event('startup')
